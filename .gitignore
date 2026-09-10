@@ -1,0 +1,30 @@
+# Secrets / local environment
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# macOS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated data and caches
+data/nfl_props_COMPLETE.db
+data/nfl_id_crosswalk.csv
+data/rookie_touch_projections.csv
+data/cache/
+cache/
+
+# Generated live predictions/results
+predictions/*.csv
+results/*.csv
+
+# Keep the bundled trained model; ignore other ad-hoc model artifacts
+models/*.joblib
+!models/nfl_td_model_v2.joblib
