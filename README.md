@@ -68,7 +68,7 @@ Qualified bets use 1/8 Kelly with confidence scaling and a 5% bankroll cap.
 
 ### Parlays
 
-The current parlay code is **not a correlated Monte Carlo simulator**. It filters qualified, priced legs with `P(TD) >= 25%`, evaluates six-leg combinations from the top candidate pool, and reports the highest joint-probability and highest-EV combinations. Joint probability uses the original conservative 0.75 haircut. Treat parlay output as experimental until enough prospective results are collected.
+The current parlay code is **not a correlated Monte Carlo simulator**. It filters qualified, priced legs with `P(TD) >= 25%`, evaluates six-leg combinations from the top candidate pool, and reports the highest joint-probability and highest-EV combinations. Joint probability applies a fixed conservative 0.75 haircut after multiplying leg probabilities. Treat parlay output as experimental until enough prospective results are collected.
 
 ## Setup
 
@@ -132,6 +132,7 @@ Current live team and position identity comes from ESPN rosters. Sleeper is used
 - Rookie priors are conservative usage seeds, not learned TD predictions.
 - Injury/status feeds can change close to kickoff; rerun the predictor near the desired betting time.
 - Odds move, so saved weekly CSVs are the source of truth for what the script actually saw before games.
+- Week-specific prediction and grading CSVs are intended to be committed so prospective performance is auditable over time.
 
 ## License
 

@@ -1,63 +1,36 @@
 #!/usr/bin/env python3
 """
-NFL Rush+Receiving anytime-TD model — leak-free rewrite (v2)
-============================================================
-Predicts P(total_tds >= 1) per player-game for prop lines. Full rebuild of the
-prior trainer, which leaked three ways and joined tables that don't actually
-share keys.
+NFL anytime-touchdown model trainer
+===================================
+Trains P(rushing TD + receiving TD >= 1) for each player-game using only
+information available before that game.
 
-WHAT CHANGED vs v1, and WHY
----------------------------
-1. pbp_td_features join + as-of-week rolling.
-   pbp_td_features holds PER-GAME values (targets, ez_targets, sum_td_prob, NGS,
-   offense_pct, ...). v1 never used it. We join it, then for every pbp feature we
-   take the player's mean over PRIOR games only (expanding().mean().shift(1)),
-   so week W sees weeks 1..W-1. Nothing from the current game enters X.
+Leakage controls
+----------------
+- Play-by-play usage features are joined by (player_id, season, week) because
+  ESPN game IDs and nflverse game IDs use different formats.
+- Per-game PBP/NGS/snap features are converted to prior-form features with
+  expanding/rolling calculations shifted by one game. The current game's
+  realized usage never enters its own feature row.
+- Missing historical values remain missing rather than being converted to fake
+  zero-usage observations. HistGradientBoosting and XGBoost consume NaN
+  directly; Random Forest uses median imputation plus missing indicators.
+- Full-season aggregate tables are excluded because they would expose future
+  information to early-season rows. Red-zone usage and opponent allowance are
+  rebuilt from per-game history as of each week.
+- A leakage audit checks for suspicious player-season constants and unusually
+  high same-game target correlation before model fitting.
 
-   JOIN KEY CORRECTION: the two tables do NOT share game_id.
-     player_game_logs.game_id = ESPN int   (401547353)
-     pbp_td_features.game_id  = nfl_data_py str ('2021_03_GB_SF')  -> 0 overlap.
-   But player_id IS shared (both ESPN; 1040/1157 pbp players match) and pbp rows
-   carry season + an encodable week. So we bridge on (player_id, season, week).
-   Verified unique per role, 73% key coverage (remainder is 2025, absent from PGL).
+Model selection
+---------------
+Random Forest, HistGradientBoosting, and XGBoost are tuned on a strict temporal
+split: train 2021-2023, validate/select on 2024, then evaluate the selected
+model once on the untouched 2025 holdout. ROC-AUC and PR-AUC are reported
+because the positive class is roughly 21%.
 
-2. Both fillna(0) calls removed. Missing pbp/rolling values stay NaN so the tree
-   models branch on "unknown" (rookie / Week 1) instead of a fake zero that reads
-   as "had the ball zero times". HistGBM and XGBoost consume NaN natively; RF gets
-   an explicit NaN-safe path (median impute + missing-indicator) so it stays
-   comparable without secretly seeing zeros.
-
-3. The three seasonal tables were the biggest leak. receiving_advanced_stats,
-   receiving_red_zone_stats, defense_vs_position_stats are keyed (player/team,
-   season) with FULL-SEASON aggregates — so a Week 1 row already knew the player's
-   whole-season red-zone rate, i.e. the future. v1's season_rz_* block was a
-   direct (player_name, season) merge of end-of-year totals. We cannot make those
-   pre-agg'd season tables as-of-week (the per-game detail is gone), so the fix is:
-   REBUILD the equivalent signal from pbp_td_features per-game rows, rolled
-   as-of-week. Red-zone volume/share now comes from ez_targets / inside5_* rolled
-   through week W-1. Opponent defense is rebuilt as the opponent's points allowed
-   to the position, rolled as-of-week from player_game_logs itself. The static
-   season tables are dropped from the feature set entirely.
-
-4. Leak audit (new). Before training we flag any feature that is (a) constant
-   within a (player_id, season) — the signature of a season-agg leak — or (b)
-   correlated with the same-game target above a threshold that no legitimately
-   lagged feature should reach. Audit prints and, for const-within-season columns,
-   hard-drops them.
-
-5. Multi-model search: RF / HistGBM / XGBoost, each with an Optuna study, NaN
-   preserved, evaluated on a strict SEASON split — train 2021-2023, val 2024,
-   test 2025 held out and scored once. (PGL lacks 2025, so pbp-only feature rows
-   with no label are dropped; if 2025 labels are unavailable the test slice is
-   reported as empty rather than faked.) Permutation importance is printed with an
-   explicit watch on sum_td_prob / rush_sum_td_prob: those are nfl_data_py's own
-   in-house TD model summed over the game. Rolled as-of-week they're a legitimate
-   prior-form signal, but if permutation shows them dominating, we're partly
-   predicting nfl_data_py's model rather than TDs — so they're reported separately
-   and can be dropped with INCLUDE_NFLDP_TDPROB=False.
-
-Base rate: anytime-TD among active players ~21%, so AUC and PR-AUC (not accuracy)
-are the metrics; a naive all-"no" baseline scores 79% accuracy and is useless.
+The nflverse `sum_td_prob` and `rush_sum_td_prob` fields are used only after
+lagging/rolling them to prior-game form. They can be disabled with
+INCLUDE_NFLDP_TDPROB=False for sensitivity checks.
 """
 
 import os

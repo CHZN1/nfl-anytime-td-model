@@ -1,41 +1,33 @@
-# %%
 #!/usr/bin/env python3
 """
-predict_td.py — NFL anytime-TD live predictions
-==================================================================
-Full rewrite of the 5,947-line CSV-driven live script. The new model
-(nfl_td_model_v2.joblib) runs on the same 30 leak-free features the trainer
-built. Historical model features come from the DB/nflverse pipeline, while
-the upcoming slate and current player identity (team/position) come from ESPN.
-The six weekly-updated red-zone CSVs and backup-QB probability machinery used
-by the old feature set are gone. Sleeper injury/status data is retained only as
-an availability filter so confirmed non-playing players never reach the final
-prediction tables.
+NFL anytime-touchdown live predictor
+====================================
+Builds the same 30 leak-controlled features used by the saved training bundle,
+resolves the upcoming NFL slate, scores player touchdown probabilities, joins
+sportsbook prices, applies availability filters, and saves the exact pregame
+state for later grading.
 
-WHAT IT DOES
-  1. pull the week's slate from ESPN
-  2. rebuild each active player's 30 features AS-OF the upcoming week (rolled
-     through the prior week — identical to NFL_TD_REAL_PREDICTIONS.py, which
-     matched real players correctly)
-  3. score P(anytime TD) with the saved model
-  4. fetch book anytime-TD odds (The Odds API) and flag value where the model's
-     probability beats the book's implied probability
-  5. tag low-confidence rows (rookies / no prior history) explicitly
+Live workflow
+-------------
+1. Resolve season/week and matchups from ESPN.
+2. Attach current ESPN roster identity so team and position reflect the current
+   season rather than a player's most recent historical team.
+3. Rebuild model features strictly as of the upcoming week from the local
+   SQLite history.
+4. Filter confirmed unavailable players using Sleeper status data.
+5. Score P(anytime TD) with the bundled model.
+6. Fetch anytime-TD prices from The Odds API and evaluate EV-based bet rules.
+7. Save weekly prediction and parlay snapshots before games are graded.
 
-WEEK 1 / PRESEASON FALLBACK
-  Before the season starts, nfl_data_py has no 2026 games. The feature builder
-  falls back to each player's MOST RECENT completed season so Week 1 isn't
-  blank. A player with NO history in any loaded season (true rookie) gets NaN
-  features -> the model uses its learned "unknown" branch, and the row is
-  tagged LOW-CONF so you know the projection is unreliable. Seeding rookies
-  from preseason touch projections is a future upgrade (see ROOKIE_PROJECTIONS).
+Early-season handling
+---------------------
+Before the current season has completed games, veterans use their most recent
+completed-season form while retaining current roster identity. True rookies can
+be seeded from `data/rookie_touch_projections.csv`; those priors are explicitly
+marked and excluded from automatic bets/parlays until real NFL history exists.
 
-ROOKIE HANDLING (current)
-  A rookie bell-cow (think a Week-1 workhorse with no NFL snaps) is the one
-  blind spot: NaN rolling features -> the model regresses him to the mean,
-  which UNDER-rates a true lead back. Rows are tagged so you don't bet them
-  blind. If you have a CSV of preseason projected touches, point
-  ROOKIE_PROJECTIONS at it and the builder seeds roll*_touch from it.
+Parlay output is experimental. It uses product probabilities with a conservative
+0.75 haircut; it is not a learned correlation model or Monte Carlo simulator.
 """
 
 import os
@@ -150,15 +142,15 @@ def normalize_team_name(team: str) -> str:
 
 
 def normalize_player_name(name: str) -> str:
-    """Normalize player names for matching - FIXED VERSION"""
+    """Normalize player names for cross-source matching."""
     if not name:
         return ""
     
     # Remove common punctuation and standardize
     name = re.sub(r'[^\w\s]', '', name).strip().lower()
     
-    # FIXED: Remove suffixes with spaces - this was the bug!
-    name = re.sub(r'\s+(jr|sr|ii|iii|iv)$', '', name)  # FIXED LINE
+    # Remove common suffixes after punctuation has been stripped.
+    name = re.sub(r'\s+(jr|sr|ii|iii|iv)$', '', name)
     
     # Handle middle initials - remove them for better matching
     name = re.sub(r'\s+[a-z]\.\s+', ' ', name)
@@ -748,12 +740,10 @@ def fetch_td_odds():
     return best
 
 
-# ── BET SIZING (ported from should_bet_td_prop_v3: 1/8 Kelly, tiered edges) ──
+# ── BET SIZING: 1/8 Kelly with tiered edge requirements ───────────────
 def evaluate_bet(prob, odds, min_edge=0.05, min_prob=0.15):
-    """Kelly-sized bet decision. prob is the MODEL's calibrated probability
-    (the trainer already calibrated it — no extra calibration layer needed).
-    Tiered edge requirements and 1/8 Kelly with a 5% cap, verbatim from the
-    old should_bet_td_prop_v3 so staking behaviour is unchanged."""
+    """Evaluate a priced anytime-TD bet using tiered edge floors and
+    1/8 Kelly sizing with a 5% bankroll cap."""
     imp = american_to_prob(odds)
     edge = (prob - imp) / imp if imp > 0 else 0.0
     out = {"should_bet": False, "prob": prob, "implied": imp, "edge": edge,
@@ -784,11 +774,10 @@ def evaluate_bet(prob, odds, min_edge=0.05, min_prob=0.15):
     return out
 
 
-# ── PARLAYS (rebuilt to match the old generate_td_parlays: 0.75 haircut,
-#    three types, ANYTIME-TD line only — the model has no 1.5 line) ──────────
-PARLAY_HAIRCUT = 0.75   # verbatim from the old script: multiply joint prob DOWN
-                        # to stay conservative. NOT a correlation boost — there
-                        # was never one, and same-team TDs may anti-correlate.
+# ── PARLAYS: ANYTIME-TD line only ─────────────────────────────────────────
+# Conservative multiplicative haircut applied after independent leg probabilities.
+# This is not a learned correlation adjustment; same-game TD outcomes may be dependent.
+PARLAY_HAIRCUT = 0.75
 
 def _parlay(legs, haircut=PARLAY_HAIRCUT):
     p = 1.0
@@ -805,12 +794,11 @@ def _parlay(legs, haircut=PARLAY_HAIRCUT):
 
 
 def generate_parlays(bets):
-    """Three parlay types, exactly as the old script produced them, on the
-    ANYTIME-TD line (the only line the model outputs):
-      1. straight probability parlay — best legs by model prob, up to 8
-      2. HIGH-PROBABILITY 6-leg — highest joint probability among top-pool combos
-      3. SLEEPER VALUE 6-leg — highest-EV 6 among top-pool combos
-    No invented correlation number; the 0.75 haircut is the old behaviour."""
+    """Build three experimental ANYTIME-TD parlay views:
+      1. probability-ranked parlay — best legs by model probability, up to 8
+      2. high-probability 6-leg — maximum adjusted joint probability
+      3. sleeper-value 6-leg — maximum estimated EV among six-leg combinations
+    The 0.75 haircut is a fixed conservative adjustment, not a correlation model."""
     import itertools
     pool = [b for b in bets if b["p_td"] >= 0.25 and b["odds"] is not None]
     # one leg per player already (bets is per-player)
@@ -929,7 +917,7 @@ def print_single_bets(bets):
 
 
 def print_parlay_table(parlays):
-    """Restore the old parlay table layout without changing current parlay math."""
+    """Print the current experimental parlay summary."""
     print(f"\n{SEP}\n  TD PARLAYS  (anytime-TD line, 0.75 haircut)\n{SEP}")
 
     if not parlays:

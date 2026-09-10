@@ -12,9 +12,9 @@ Repo:
 
 Local Documents workflow:
     python grade_predictions.py --season 2026 --week 1 \
-        --predictions ~/Documents/nfl_td_predictions_2026_week01.csv \
-        --parlays ~/Documents/nfl_td_parlays_2026_week01.csv \
-        --out-dir ~/Documents/nfl_td_results
+        --predictions predictions/nfl_td_predictions_2026_week01.csv \
+        --parlays predictions/nfl_td_parlays_2026_week01.csv \
+        --out-dir results
 """
 
 from __future__ import annotations

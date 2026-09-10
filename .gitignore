@@ -21,9 +21,13 @@ data/rookie_touch_projections.csv
 data/cache/
 cache/
 
-# Generated live predictions/results
-predictions/*.csv
-results/*.csv
+# Prospective weekly prediction/result snapshots are intentionally trackable.
+# Ignore only rolling/latest exports and temporary files.
+predictions/nfl_td_predictions_[0-9][0-9][0-9][0-9].csv
+predictions/*_latest.csv
+results/*_latest.csv
+predictions/*.tmp
+results/*.tmp
 
 # Keep the bundled trained model; ignore other ad-hoc model artifacts
 models/*.joblib
