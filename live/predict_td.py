@@ -854,7 +854,7 @@ def _form_label(row):
 
 
 def print_prediction_table(rows, top_n=30):
-    """Render the ranked prediction table for the current model output."""
+    """Old-style ranked table adapted to the current 2026 model output."""
     if not rows:
         print(f"\n{SEP}\n  TOP PROJECTIONS\n{SEP}")
         print("  no valid projections")

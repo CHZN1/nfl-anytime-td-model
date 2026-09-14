@@ -44,6 +44,16 @@ def normalize_player_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
+TEAM_ALIASES = {
+    "WSH": "WAS", "JAC": "JAX", "LA": "LAR", "STL": "LAR",
+    "SD": "LAC", "OAK": "LV",
+}
+
+def normalize_team(team) -> str:
+    t = str(team or "").strip().upper()
+    return TEAM_ALIASES.get(t, t)
+
+
 def american_to_decimal(odds) -> float:
     a = float(odds)
     return a / 100.0 + 1.0 if a > 0 else 100.0 / abs(a) + 1.0
@@ -81,8 +91,8 @@ def fetch_game_actuals(game):
     game_id = str(game.get("id", ""))
     comp = (game.get("competitions") or [{}])[0]
     competitors = comp.get("competitors", [])
-    home = next((c.get("team", {}).get("abbreviation") for c in competitors if c.get("homeAway") == "home"), "")
-    away = next((c.get("team", {}).get("abbreviation") for c in competitors if c.get("homeAway") == "away"), "")
+    home = normalize_team(next((c.get("team", {}).get("abbreviation") for c in competitors if c.get("homeAway") == "home"), ""))
+    away = normalize_team(next((c.get("team", {}).get("abbreviation") for c in competitors if c.get("homeAway") == "away"), ""))
     completed = str((comp.get("status") or {}).get("type", {}).get("completed", False)).lower() == "true"
     if not completed:
         completed = bool((comp.get("status") or {}).get("type", {}).get("completed", False))
@@ -95,7 +105,7 @@ def fetch_game_actuals(game):
     # multiple stat categories; rushing + receiving TDs are summed separately.
     players = {}
     for team_block in (data.get("boxscore") or {}).get("players", []):
-        team = (team_block.get("team") or {}).get("abbreviation", "")
+        team = normalize_team((team_block.get("team") or {}).get("abbreviation", ""))
         opp = away if team == home else home
         for category in team_block.get("statistics", []):
             cname = str(category.get("name", "")).lower()
@@ -156,7 +166,7 @@ def _prediction_match(pred, actuals: pd.DataFrame):
         return None
 
     pid = _safe_int(pred.get("player_id"))
-    team = str(pred.get("team") or "")
+    team = normalize_team(pred.get("team"))
     if pid is not None and "player_id" in actuals.columns:
         m = actuals[actuals["player_id"] == pid]
         if team and len(m):
@@ -179,8 +189,8 @@ def grade_predictions(preds: pd.DataFrame, actuals: pd.DataFrame, games: pd.Data
     completed_teams = set()
     if len(games):
         done = games[games["completed"] == True]  # noqa: E712
-        completed_teams.update(done["home"].dropna().astype(str))
-        completed_teams.update(done["away"].dropna().astype(str))
+        completed_teams.update(done["home"].dropna().map(normalize_team))
+        completed_teams.update(done["away"].dropna().map(normalize_team))
 
     rows = []
     for _, p in preds.iterrows():
@@ -197,7 +207,7 @@ def grade_predictions(preds: pd.DataFrame, actuals: pd.DataFrame, games: pd.Data
                 "result_status": "GRADED",
                 "hit": bool(actual_tds > line),
             })
-        elif str(p.get("team", "")) not in completed_teams:
+        elif normalize_team(p.get("team")) not in completed_teams:
             rec.update({
                 "actual_tds": np.nan,
                 "rushing_td": np.nan,
