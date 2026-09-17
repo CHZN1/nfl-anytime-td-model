@@ -1219,39 +1219,141 @@ def _parlay(legs, haircut=PARLAY_HAIRCUT):
             "probability": p, "dec_odds": dec, "ev": ev}
 
 
-def generate_parlays(bets):
-    """Build three experimental ANYTIME-TD parlay views:
-      1. probability-ranked parlay — best legs by model probability, up to 8
-      2. high-probability 6-leg — maximum adjusted joint probability
-      3. sleeper-value 6-leg — maximum estimated EV among six-leg combinations
-    The 0.75 haircut is a fixed conservative adjustment, not a correlation model."""
+def generate_parlays(rows):
+    """Build three genuinely distinct anytime-TD parlays.
+
+    PROBABILITY:
+      - sportsbook-priced players only
+      - highest model P(TD)
+      - no EV requirement
+
+    EV:
+      - sportsbook-priced players only
+      - P(TD) >= 30%
+      - positive model edge required
+      - choose the 6-leg combination with the highest estimated parlay EV
+
+    SLEEPER:
+      - sportsbook-priced players only
+      - odds >= +300
+      - 15% <= P(TD) < 35%
+      - positive model edge required
+      - exclude Probability/EV legs when enough alternatives exist
+      - rank by a balanced probability/edge score, not raw odds alone
+
+    True rookie projection seeds remain excluded from automatic parlays until
+    real NFL history exists.
+    """
     import itertools
-    pool = [b for b in bets if b["p_td"] >= 0.25 and b["odds"] is not None]
-    # one leg per player already (bets is per-player)
-    pool.sort(key=lambda b: -b["p_td"])
+
+    def leg_key(r):
+        return r.get("player_id") or normalize_player_name(r.get("player", ""))
+
+    # Market/availability gate only.
+    priced_pool = [
+        r for r in rows
+        if r.get("odds") is not None
+        and not r.get("is_rookie_seed", False)
+    ]
+
     out = []
 
-    # 1. straight probability parlay (up to 8 legs, best prob)
-    if len(pool) >= 2:
-        legs = pool[:8]
-        pl = _parlay(legs)
-        pl["type"] = f"{len(legs)}-leg anytime-TD (probability)"
-        out.append(pl)
+    # ------------------------------------------------------------------
+    # 1) PROBABILITY PARLAY — pure hit probability
+    # ------------------------------------------------------------------
+    prob_pool = sorted(
+        [r for r in priced_pool if r.get("p_td", 0.0) > 0],
+        key=lambda r: r.get("p_td", 0.0),
+        reverse=True,
+    )
 
-    # 2 & 3. Exhaustive 6-leg combinations from the top ~10 by probability
-    cand = pool[:10]
-    if len(cand) >= 6:
-        combos = list(itertools.combinations(cand, 6))
-        scored = [_parlay(list(c)) for c in combos]
-        # HIGH-PROB: max joint probability
-        hp = max(scored, key=lambda x: x["probability"])
-        hp = dict(hp); hp["type"] = "6-leg anytime-TD High-Probability"
-        out.append(hp)
-        # SLEEPER: max EV (tends to longer odds)
-        sv = max(scored, key=lambda x: x["ev"])
-        sv = dict(sv); sv["type"] = "6-leg anytime-TD Sleeper Value"
-        if sv["legs"] != hp["legs"]:
-            out.append(sv)
+    probability_legs = []
+    if len(prob_pool) >= 2:
+        probability_legs = prob_pool[:8]
+        prob_pl = _parlay(probability_legs)
+        prob_pl["type"] = f"{len(probability_legs)}-leg anytime-TD PROBABILITY"
+        out.append(prob_pl)
+
+    probability_keys = {leg_key(r) for r in probability_legs}
+
+    # ------------------------------------------------------------------
+    # 2) EV PARLAY — quality floor first, then maximize EV
+    # ------------------------------------------------------------------
+    ev_pool = []
+    for r in priced_pool:
+        p = float(r.get("p_td", 0.0) or 0.0)
+        edge = (r.get("eval") or {}).get("edge")
+        if p >= 0.30 and edge is not None and edge > 0:
+            ev_pool.append(r)
+
+    ev_legs = []
+    if len(ev_pool) >= 6:
+        # Keep search bounded but broad enough to include both probability and edge leaders.
+        by_prob = sorted(ev_pool, key=lambda r: r.get("p_td", 0.0), reverse=True)[:14]
+        by_edge = sorted(
+            ev_pool,
+            key=lambda r: (r.get("eval") or {}).get("edge", -999.0),
+            reverse=True,
+        )[:10]
+
+        candidate_map = {}
+        for r in by_prob + by_edge:
+            candidate_map[leg_key(r)] = r
+        ev_candidates = list(candidate_map.values())
+
+        # Exhaustive 6-leg search over the bounded quality pool.
+        scored = []
+        for combo in itertools.combinations(ev_candidates, 6):
+            pl = _parlay(list(combo))
+            scored.append(pl)
+
+        best_ev = max(scored, key=lambda x: x["ev"])
+        ev_legs = best_ev["legs"]
+        best_ev = dict(best_ev)
+        best_ev["type"] = "6-leg anytime-TD EV"
+        out.append(best_ev)
+
+    ev_keys = {leg_key(r) for r in ev_legs}
+
+    # ------------------------------------------------------------------
+    # 3) SLEEPER PARLAY — intentionally longer-shot value
+    # ------------------------------------------------------------------
+    sleeper_base = []
+    for r in priced_pool:
+        p = float(r.get("p_td", 0.0) or 0.0)
+        edge = (r.get("eval") or {}).get("edge")
+        odds = r.get("odds")
+        if (
+            odds is not None
+            and odds >= 300
+            and 0.15 <= p < 0.35
+            and edge is not None
+            and edge > 0
+        ):
+            rr = dict(r)
+            # Cap edge contribution so absurd long-shot prices cannot dominate.
+            capped_edge = min(float(edge), 1.00)
+            rr["_sleeper_score"] = p * (1.0 + 0.50 * capped_edge)
+            sleeper_base.append(rr)
+
+    # First try to keep sleepers fully distinct from probability + EV parlays.
+    used_keys = probability_keys | ev_keys
+    sleeper_distinct = [r for r in sleeper_base if leg_key(r) not in used_keys]
+
+    # If there are not six fully distinct sleeper candidates, allow overlap only
+    # as needed, preserving the sleeper eligibility rules.
+    sleeper_pool = sleeper_distinct if len(sleeper_distinct) >= 6 else sleeper_base
+
+    sleeper_pool.sort(key=lambda r: r["_sleeper_score"], reverse=True)
+
+    if len(sleeper_pool) >= 6:
+        sleeper_legs = sleeper_pool[:6]
+        for r in sleeper_legs:
+            r.pop("_sleeper_score", None)
+        sleeper_pl = _parlay(sleeper_legs)
+        sleeper_pl["type"] = "6-leg anytime-TD SLEEPER"
+        out.append(sleeper_pl)
+
     return out
 
 
@@ -1328,7 +1430,11 @@ def print_showcase_prediction_tables(rows, matchup, top_n=15):
         return
     for g in games:
         teams = {g["home"], g["away"]}
-        game_rows = [r for r in rows if normalize_team_name(str(r.get("team", ""))) in teams]
+        game_rows = [
+            r for r in rows
+            if normalize_team_name(str(r.get("team", ""))) in teams
+            and r.get("odds") is not None
+        ]
         game_rows.sort(key=lambda r: r.get("p_td", 0.0), reverse=True)
         if top_n is not None:
             game_rows = game_rows[:top_n]
@@ -1340,23 +1446,55 @@ def print_showcase_prediction_tables(rows, matchup, top_n=15):
             continue
         print(
             f"  {'#':>2} {'player':<24} {'pos':<4} {'tm':<4}"
-            f"{'P(TD)':>8} {'fair':>7} {'book':<14} {'odds':>7} {'edge':>8}"
+            f"{'P(TD)':>8} {'book':<14} {'odds':>7} {'edge':>8}"
             f" {'touch8':>7} {'ezC':>6} {'ezT':>6} {'form':>8}"
         )
         print("  " + "-" * 110)
         for i, r in enumerate(game_rows, 1):
             team = str(r.get("team", ""))[:4]
-            fair = r.get("fair")
-            fair_s = "—" if fair is None or pd.isna(fair) else f"{int(fair):+d}"
             book = str(r.get("book", "—") or "—")[:14]
             touch8, ezc, ezt = r.get("touch8", np.nan), r.get("ez_car", np.nan), r.get("ez_tgt", np.nan)
             print(
                 f"  {i:>2}. {str(r['player'])[:23]:<24} "
                 f"{str(r.get('pos',''))[:3]:<4} {team:<4}"
-                f"{r['p_td']:>8.1%} {fair_s:>7} {book:<14} {_fmt_odds(r.get('odds')):>7}"
+                f"{r['p_td']:>8.1%} {book:<14} {_fmt_odds(r.get('odds')):>7}"
                 f"{_fmt_edge(r):>8} {touch8:>7.1f} {ezc:>6.2f} {ezt:>6.2f} {_form_label(r):>8}"
             )
         print("\n  form: 2026=current-season history | 2025=prior-season fallback | ROOKIE=projection seed")
+
+def print_top_probability_predictions(rows, top_n=30):
+    """Print highest model TD probabilities among players with a posted anytime-TD price.
+
+    A sportsbook price is required only as a market/availability filter so
+    unpriced backups do not appear. Ranking remains strictly by model P(TD);
+    positive EV and plus-money odds are NOT required.
+    """
+    priced_rows = [r for r in rows if r.get("odds") is not None]
+    ranked = sorted(priced_rows, key=lambda r: r.get("p_td", 0.0), reverse=True)
+    if top_n is not None:
+        ranked = ranked[:top_n]
+
+    print(f"\n{SEP}\n  TOP ANYTIME TD PREDICTIONS  (priced players, sorted by P(TD))\n{SEP}")
+    if not ranked:
+        print("  no sportsbook-priced prediction rows available")
+        return
+
+    print(
+        f"  {'#':>2} {'player':<24} {'pos':<4} {'tm':<4} {'matchup':<10}"
+        f"{'P(TD)':>8} {'book':<14} {'odds':>7} {'edge':>8} {'form':>8}"
+    )
+    print("  " + "-" * 100)
+
+    for i, r in enumerate(ranked, 1):
+        matchup = f"{r.get('team','')}-{r.get('opp','')}"
+        book = str(r.get("book", "—") or "—")[:14]
+        print(
+            f"  {i:>2}. {str(r.get('player',''))[:23]:<24} "
+            f"{str(r.get('pos',''))[:3]:<4} {str(r.get('team',''))[:4]:<4} {matchup[:9]:<10}"
+            f"{r.get('p_td',0.0):>8.1%} {book:<14} {_fmt_odds(r.get('odds')):>7}"
+            f"{_fmt_edge(r):>8} {_form_label(r):>8}"
+        )
+
 
 def print_single_bets(bets):
     print(f"\n{SEP}\n  QUALIFIED SINGLE BETS  (sorted by P(TD), 1/8 Kelly, tiered edges)\n{SEP}")
@@ -1387,7 +1525,7 @@ def print_parlay_table(parlays):
     print(f"\n{SEP}\n  TD PARLAYS  (anytime-TD line, 0.75 haircut)\n{SEP}")
 
     if not parlays:
-        print("  need >=2 qualified legs (P>=0.25, priced) to build parlays")
+        print("  need enough sportsbook-priced eligible players to build parlays")
         return
 
     for i, p in enumerate(parlays, 1):
@@ -1401,7 +1539,7 @@ def print_parlay_table(parlays):
         print(f"\n  #{i} {p['type'].upper()}")
         print(f"  {'-' * 106}")
         print(f"  Estimated win probability: {p['probability']:.2%}")
-        print(f"  Fair odds:                 {am:+d}")
+        print(f"  Model-implied odds:        {am:+d}")
         print(f"  Combined decimal odds:     {p['dec_odds']:.2f}x")
         print(f"  Estimated EV:              {p['ev']:+.2f}u")
         print(f"  Average leg probability:   {avg_prob:.1%}")
@@ -1541,13 +1679,20 @@ def main():
         and not r.get("is_rookie_seed", False)
     ]
     bets.sort(key=lambda r: r.get("p_td", 0.0), reverse=True)
+
+    # First table requires a posted anytime-TD price as a market/availability
+    # filter, then ranks strictly by model P(TD). It does NOT require +EV or
+    # plus-money odds.
+    print_top_probability_predictions(rows, top_n=30)
+
+    # Betting-qualified subset remains separate for Kelly sizing only.
     print_single_bets(bets)
 
-    # ── PARLAYS (3 types, 0.75 haircut) ──
-    parlays = generate_parlays(bets)
+    # ── PARLAYS: distinct probability / quality-floor EV / sleeper logic ──
+    parlays = generate_parlays(rows)
     print_parlay_table(parlays)
 
-    # Dedicated standalone/holiday projection tables; no generic all-slate Top-30 table.
+    # Dedicated standalone/holiday tables: priced players only, ranked by P(TD).
     print_showcase_prediction_tables(rows, matchup, top_n=15)
 
     # Persist the exact pregame decision state for prospective grading.
