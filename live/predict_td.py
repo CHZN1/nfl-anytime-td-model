@@ -266,46 +266,483 @@ def prob_to_american(p):
 
 # ── SLATE RESOLUTION (which week, which teams play) ─────────────────────────
 def resolve_slate(week=None):
-    """Return (season, week, playing_team_abbrs) for the upcoming slate.
+    """Return exactly one NFL regular-season week and its matchup map.
 
-    ESPN's scoreboard auto-advances: hit with no week and it returns the
-    CURRENT/UPCOMING week's games even if today has none (NFL is weekly, so
-    'today' is usually empty). Pass week= to force a specific week.
+    ESPN's unscoped scoreboard can contain spillover events from the previous
+    Thursday/Monday window. We use it only to discover the target week, then
+    ALWAYS refetch that explicit week before building team_ids/matchup. This
+    prevents Week 1 showcase games from leaking into a Week 2 prediction run.
     """
-    params = {}
-    if week:
-        params["week"] = week
+    base_params = {"dates": CURRENT_SEASON, "seasontype": 2}
+    target_week = week
+    if target_week is None:
+        probe = get(
+            f"{ESPN}/scoreboard",
+            base_params,
+            cache_namespace="espn_slate_probe" if "CACHE_TTL" in globals() else None,
+            cache_ttl=(CACHE_TTL.get("espn_slate") if "CACHE_TTL" in globals() else None),
+        ) if "CACHE_TTL" in globals() else get(f"{ESPN}/scoreboard", base_params)
+        if not probe:
+            return None, None, set(), {}
+        target_week = (probe.get("week") or {}).get("number")
+        if target_week is None:
+            target_week = 1
+
+    params = {**base_params, "week": int(target_week)}
     data = get(
         f"{ESPN}/scoreboard",
         params,
-        cache_namespace="espn_slate",
-        cache_ttl=CACHE_TTL["espn_slate"],
-    )
+        cache_namespace="espn_slate_week" if "CACHE_TTL" in globals() else None,
+        cache_ttl=(CACHE_TTL.get("espn_slate") if "CACHE_TTL" in globals() else None),
+    ) if "CACHE_TTL" in globals() else get(f"{ESPN}/scoreboard", params)
     if not data:
-        return None, None, set()
-    wk = (data.get("week") or {}).get("number", week or 1)
-    seas = (data.get("season") or {}).get("year", CURRENT_SEASON)
+        return None, None, set(), {}
+
+    wk = int((data.get("week") or {}).get("number", target_week))
+    seas = int((data.get("season") or {}).get("year", CURRENT_SEASON))
+    if wk != int(target_week):
+        raise RuntimeError(
+            f"ESPN returned week {wk} for explicit week {target_week}; refusing to mix slates."
+        )
+
     team_ids = set()
-    matchup = {}      # team_id -> {"abbr":, "opp":} for labelling the table
+    matchup = {}
+    seen_game_ids = set()
     for ev in data.get("events", []):
+        ev_week = None
+        try:
+            ev_week = int(((ev.get("week") or {}).get("number")))
+        except Exception:
+            pass
+        if ev_week is not None and ev_week != wk:
+            continue
+
+        gid = _safe_int(ev.get("id"), 0)
+        if gid and gid in seen_game_ids:
+            continue
+        if gid:
+            seen_game_ids.add(gid)
+
         for comp in ev.get("competitions", []):
             cs = comp.get("competitors", [])
             ids = []
             for c in cs:
-                tid = c.get("team", {}).get("id")
-                ab = c.get("team", {}).get("abbreviation")
-                if tid is not None:
-                    try:
-                        tid = int(tid); team_ids.add(tid)
-                        ids.append((tid, ab))
-                    except (TypeError, ValueError):
-                        pass
-            # two competitors -> each is the other's opponent
+                tid = (c.get("team") or {}).get("id")
+                abbr = (c.get("team") or {}).get("abbreviation", "")
+                if tid is None:
+                    continue
+                try:
+                    tid = int(tid)
+                except Exception:
+                    continue
+                team_ids.add(tid)
+                ids.append((tid, abbr, c.get("homeAway")))
             if len(ids) == 2:
-                (t0, a0), (t1, a1) = ids
-                matchup[t0] = {"abbr": a0, "opp": a1}
-                matchup[t1] = {"abbr": a1, "opp": a0}
+                home = next((x for x in ids if x[2] == "home"), ids[0])
+                away = next((x for x in ids if x[2] == "away"), ids[1])
+                venue = (comp.get("venue") or {}).get("fullName", "Unknown")
+                wx = _venue_proxy(venue)
+                spread, total = _extract_home_spread_total(ev)
+                common = dict(
+                    game_id=gid,
+                    event_date=ev.get("date", ""),
+                    home_abbr=home[1],
+                    away_abbr=away[1],
+                    venue=venue,
+                    temperature=wx["temperature"],
+                    dome_game=wx["dome_game"],
+                    weather_impact_score=wx["weather_impact_score"],
+                    point_spread=spread,
+                    over_under=total,
+                    slate_week=wk,
+                )
+                matchup[home[0]] = {"abbr": home[1], "opp": away[1], "opp_id": away[0], **common}
+                matchup[away[0]] = {"abbr": away[1], "opp": home[1], "opp_id": home[0], **common}
+
+    if len(team_ids) > 32:
+        raise RuntimeError(
+            f"resolved {len(team_ids)} teams for week {wk}; slate contains mixed-week events."
+        )
     return seas, wk, team_ids, matchup
+
+
+# ── CURRENT-SEASON AUTO-SYNC + UPCOMING-GAME FEATURE BUILD ──────────────────
+# Historical seasons remain in the local DB. Before Week 2+, completed games
+# from CURRENT_SEASON are refreshed automatically from ESPN + nfl_data_py so the
+# live predictor never silently falls back to stale prior-season form.
+
+DOME_STADIUMS = {
+    "AT&T Stadium", "Mercedes-Benz Stadium", "Caesars Superdome",
+    "Mercedes-Benz Superdome", "Ford Field", "Lucas Oil Stadium",
+    "U.S. Bank Stadium", "State Farm Stadium", "University of Phoenix Stadium",
+    "Allegiant Stadium", "SoFi Stadium", "NRG Stadium",
+}
+
+
+def _venue_proxy(venue):
+    venue = str(venue or "Unknown")
+    if venue in DOME_STADIUMS:
+        return dict(temperature=72.0, dome_game=1.0, weather_impact_score=0.0)
+    v = venue.lower()
+    if any(city in v for city in ("green bay", "chicago", "buffalo", "cleveland", "detroit", "minnesota")):
+        return dict(temperature=45.0, dome_game=0.0, weather_impact_score=2.0)
+    if any(city in v for city in ("miami", "tampa", "arizona", "las vegas", "dallas", "houston")):
+        return dict(temperature=78.0, dome_game=0.0, weather_impact_score=0.5)
+    return dict(temperature=62.0, dome_game=0.0, weather_impact_score=1.0)
+
+
+def _safe_int(v, default=0):
+    try:
+        s = str(v).strip()
+        if s in {"", "--", "N/A", "None", "nan"}:
+            return default
+        if "/" in s or "-" in s:
+            s = s.replace("/", "-").split("-")[0]
+        return int(float(s))
+    except Exception:
+        return default
+
+
+def _safe_float(v, default=np.nan):
+    try:
+        if v is None or isinstance(v, dict):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _extract_home_spread_total(event):
+    comp = ((event or {}).get("competitions") or [{}])[0]
+    competitors = comp.get("competitors") or []
+    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+    home_abbr = ((home or {}).get("team") or {}).get("abbreviation")
+    entries = comp.get("odds") or []
+    if not entries:
+        return np.nan, np.nan
+    entry = entries[0]
+    total = _safe_float(entry.get("overUnder"))
+    spread = entry.get("spread")
+    if spread is None or isinstance(spread, dict):
+        return np.nan, total
+    mag = abs(_safe_float(spread, 0.0))
+    home_odds = entry.get("homeTeamOdds") or {}
+    away_odds = entry.get("awayTeamOdds") or {}
+    home_fav = None
+    if home_odds.get("favorite") is True:
+        home_fav = True
+    elif away_odds.get("favorite") is True:
+        home_fav = False
+    if home_fav is None:
+        details = str(entry.get("details", "")).strip()
+        fav = details.split()[0] if details else None
+        if fav and home_abbr:
+            home_fav = fav == home_abbr
+    if home_fav is None:
+        return np.nan, total
+    return (-mag if home_fav else mag), total
+
+
+def _parse_espn_player_stats(summary, game):
+    box = (summary or {}).get("boxscore") or {}
+    teams = box.get("players") or []
+    out = {}
+    for team_data in teams:
+        team_id = _safe_int((team_data.get("team") or {}).get("id"), 0)
+        if not team_id:
+            continue
+        for category in team_data.get("statistics", []):
+            stat_name = str(category.get("name", "")).lower()
+            for athlete_data in category.get("athletes", []):
+                athlete = athlete_data.get("athlete") or {}
+                if not athlete.get("id"):
+                    continue
+                pid = _safe_int(athlete.get("id"), 0)
+                if not pid:
+                    continue
+                stats = athlete_data.get("stats") or []
+                p = out.setdefault(pid, {
+                    "player_id": pid,
+                    "player_name": athlete.get("displayName", f"Player_{pid}"),
+                    "team_id": team_id,
+                    "rushing_tds": 0,
+                    "rushing_attempts": 0,
+                    "receiving_tds": 0,
+                    "targets": 0,
+                })
+                if "rushing" in stat_name and len(stats) >= 2:
+                    p["rushing_attempts"] = _safe_int(stats[0])
+                    p["rushing_tds"] = _safe_int(stats[3] if len(stats) > 3 else 0)
+                elif "receiving" in stat_name and len(stats) >= 2:
+                    p["receiving_tds"] = _safe_int(stats[3] if len(stats) > 3 else 0)
+                    p["targets"] = _safe_int(stats[5] if len(stats) > 5 else stats[0])
+    return list(out.values())
+
+
+def _sync_current_boxscores(conn, target_week):
+    """Incrementally cache completed current-season box scores before target_week."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_game_logs (
+            player_id INTEGER, player_name TEXT, game_id INTEGER, season INTEGER,
+            week INTEGER, team_id INTEGER, opponent_id INTEGER, home_away TEXT,
+            game_date TEXT, rushing_tds INTEGER, rushing_attempts INTEGER,
+            receiving_tds INTEGER, targets INTEGER, UNIQUE(player_id, game_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS game_context (
+            game_id INTEGER, season INTEGER, week INTEGER, home_team_id INTEGER,
+            away_team_id INTEGER, venue TEXT, game_date TEXT, temperature REAL,
+            dome_game REAL, weather_impact_score REAL, point_spread REAL,
+            over_under REAL, UNIQUE(game_id)
+        )
+    """)
+    collected_games = 0
+    for week in range(1, max(1, int(target_week))):
+        data = get(f"{ESPN}/scoreboard", {"dates": CURRENT_SEASON, "seasontype": 2, "week": week}) or {}
+        for event in data.get("events", []):
+            status = ((event.get("status") or {}).get("type") or {})
+            if status.get("completed") is not True:
+                continue
+            comp = (event.get("competitions") or [{}])[0]
+            cs = comp.get("competitors") or []
+            if len(cs) < 2:
+                continue
+            home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
+            away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
+            gid = _safe_int(event.get("id"), 0)
+            hid = _safe_int((home.get("team") or {}).get("id"), 0)
+            aid = _safe_int((away.get("team") or {}).get("id"), 0)
+            if not gid or not hid or not aid:
+                continue
+            summary = get(f"{ESPN}/summary", {"event": gid}) or {}
+            players = _parse_espn_player_stats(summary, event)
+            if not players:
+                continue
+            venue = (comp.get("venue") or {}).get("fullName", "Unknown")
+            wx = _venue_proxy(venue)
+            spread, total = _extract_home_spread_total(event)
+            conn.execute("""
+                INSERT INTO game_context
+                    (game_id, season, week, home_team_id, away_team_id, venue,
+                     game_date, temperature, dome_game, weather_impact_score,
+                     point_spread, over_under)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_id) DO UPDATE SET
+                    season=excluded.season, week=excluded.week,
+                    home_team_id=excluded.home_team_id, away_team_id=excluded.away_team_id,
+                    venue=excluded.venue, game_date=excluded.game_date,
+                    temperature=excluded.temperature, dome_game=excluded.dome_game,
+                    weather_impact_score=excluded.weather_impact_score,
+                    point_spread=COALESCE(excluded.point_spread, game_context.point_spread),
+                    over_under=COALESCE(excluded.over_under, game_context.over_under)
+            """, (gid, CURRENT_SEASON, week, hid, aid, venue, event.get("date"),
+                  wx["temperature"], wx["dome_game"], wx["weather_impact_score"],
+                  None if pd.isna(spread) else float(spread),
+                  None if pd.isna(total) else float(total)))
+            for p in players:
+                is_home = int(p["team_id"]) == hid
+                opp = aid if is_home else hid
+                conn.execute("""
+                    INSERT INTO player_game_logs
+                        (player_id, player_name, game_id, season, week, team_id,
+                         opponent_id, home_away, game_date, rushing_tds,
+                         rushing_attempts, receiving_tds, targets)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(player_id, game_id) DO UPDATE SET
+                        player_name=excluded.player_name, season=excluded.season,
+                        week=excluded.week, team_id=excluded.team_id,
+                        opponent_id=excluded.opponent_id, home_away=excluded.home_away,
+                        game_date=excluded.game_date, rushing_tds=excluded.rushing_tds,
+                        rushing_attempts=excluded.rushing_attempts,
+                        receiving_tds=excluded.receiving_tds, targets=excluded.targets
+                """, (p["player_id"], p["player_name"], gid, CURRENT_SEASON, week,
+                      p["team_id"], opp, "home" if is_home else "away", event.get("date"),
+                      p["rushing_tds"], p["rushing_attempts"], p["receiving_tds"], p["targets"]))
+            collected_games += 1
+    conn.commit()
+    return collected_games
+
+
+def _build_live_pbp_rows(target_week):
+    """Build CURRENT_SEASON per-game PBP features with the same definitions as training."""
+    try:
+        import nfl_data_py as nfl
+    except ImportError as exc:
+        raise RuntimeError("nfl_data_py is required for Week 2+ current-season features") from exc
+
+    cache_root = Path(os.getenv("NFL_TD_LIVE_CACHE", str(Path(DB).expanduser().parent / "nfl_td_cache")))
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_root / f"live_pbp_{CURRENT_SEASON}_through_week_{int(target_week)-1}.parquet"
+    if cache_path.exists():
+        try:
+            cached = pd.read_parquet(cache_path)
+            if not cached.empty:
+                return cached
+        except Exception:
+            pass
+
+    pbp = nfl.import_pbp_data([CURRENT_SEASON], downcast=True, cache=False)
+    if pbp is None or pbp.empty:
+        raise RuntimeError(f"nfl_data_py returned no {CURRENT_SEASON} play-by-play data")
+    if "week" not in pbp.columns:
+        pbp["week"] = pd.to_numeric(pbp["game_id"].astype(str).str.split("_").str[1], errors="coerce")
+    pbp = pbp[pd.to_numeric(pbp["week"], errors="coerce") < int(target_week)].copy()
+    if pbp.empty:
+        raise RuntimeError(f"no completed {CURRENT_SEASON} PBP rows exist before Week {target_week}")
+
+    rec = pbp[pbp.get("receiver_player_id").notna()].copy() if "receiver_player_id" in pbp.columns else pbp.iloc[0:0].copy()
+    if not rec.empty:
+        yl = pd.to_numeric(rec["yardline_100"], errors="coerce")
+        rec["_ez"] = (yl <= 20).astype(float)
+        rec["_i10"] = (yl <= 10).astype(float)
+        rec["_i5"] = (yl <= 5).astype(float)
+        rec["_ay"] = pd.to_numeric(rec.get("air_yards"), errors="coerce")
+        rec["_tdp"] = pd.to_numeric(rec.get("td_prob"), errors="coerce")
+        recg = (rec.groupby(["receiver_player_id", "game_id", "posteam"])
+                  .agg(targets=("receiver_player_id", "size"), ez_targets=("_ez", "sum"),
+                       inside10_targets=("_i10", "sum"), inside5_targets=("_i5", "sum"),
+                       air_yards_game=("_ay", "sum"), sum_td_prob=("_tdp", "sum"))
+                  .reset_index().rename(columns={"receiver_player_id":"player_id", "posteam":"team"}))
+        recg["role"] = "rec"
+        recg["adot_game"] = recg["air_yards_game"] / recg["targets"].replace(0, np.nan)
+    else:
+        recg = pd.DataFrame()
+
+    rush = pbp[pbp.get("rusher_player_id").notna()].copy() if "rusher_player_id" in pbp.columns else pbp.iloc[0:0].copy()
+    if not rush.empty:
+        yl = pd.to_numeric(rush["yardline_100"], errors="coerce")
+        gtg = pd.to_numeric(rush.get("goal_to_go"), errors="coerce")
+        rush["_ez"] = ((yl <= 10) & (gtg == 1)).astype(float)
+        rush["_i5"] = (yl <= 5).astype(float)
+        rush["_tdp"] = pd.to_numeric(rush.get("td_prob"), errors="coerce")
+        rushg = (rush.groupby(["rusher_player_id", "game_id", "posteam"])
+                   .agg(carries=("rusher_player_id", "size"), ez_carries=("_ez", "sum"),
+                        inside5_carries=("_i5", "sum"), rush_sum_td_prob=("_tdp", "sum"))
+                   .reset_index().rename(columns={"rusher_player_id":"player_id", "posteam":"team"}))
+        rushg["role"] = "rush"
+    else:
+        rushg = pd.DataFrame()
+
+    pg = pd.concat([recg, rushg], ignore_index=True)
+    if pg.empty:
+        raise RuntimeError(f"unable to aggregate {CURRENT_SEASON} PBP into player-game rows")
+    pg["season"] = CURRENT_SEASON
+
+    if not recg.empty:
+        team_ez = recg.groupby(["team", "game_id"])["ez_targets"].sum().rename("team_ez_targets").reset_index()
+        pg = pg.merge(team_ez, on=["team", "game_id"], how="left")
+        pg["ez_target_share"] = pg.get("ez_targets") / pg["team_ez_targets"].replace(0, np.nan)
+
+    xw = pd.read_csv(CROSSWALK)
+    xw["espn_id"] = pd.to_numeric(xw["espn_id"], errors="coerce")
+    xw = xw.dropna(subset=["espn_id", "gsis_id"]).copy()
+    xw["espn_id"] = xw["espn_id"].astype("int64")
+    gsis_to_espn = dict(zip(xw["gsis_id"], xw["espn_id"]))
+    pfr_to_espn = dict(zip(xw.dropna(subset=["pfr_id"])["pfr_id"], xw.dropna(subset=["pfr_id"])["espn_id"])) if "pfr_id" in xw.columns else {}
+
+    try:
+        ngs = nfl.import_ngs_data("receiving", [CURRENT_SEASON])
+        if ngs is not None and not ngs.empty:
+            ngs = ngs[pd.to_numeric(ngs["week"], errors="coerce") < int(target_week)].copy()
+            sched = nfl.import_schedules([CURRENT_SEASON])[["game_id", "week", "home_team", "away_team"]]
+            long_sched = pd.concat([
+                sched.rename(columns={"home_team":"team"})[["game_id","week","team"]],
+                sched.rename(columns={"away_team":"team"})[["game_id","week","team"]],
+            ])
+            nk = ngs.rename(columns={"player_gsis_id":"player_id", "team_abbr":"team"})
+            keep = [c for c in ["player_id","team","week","avg_separation","avg_cushion","avg_intended_air_yards","percent_share_of_intended_air_yards"] if c in nk.columns]
+            nk = nk[keep].merge(long_sched, on=["team","week"], how="left").rename(columns={
+                "avg_separation":"ngs_separation", "avg_cushion":"ngs_cushion",
+                "avg_intended_air_yards":"ngs_intended_air",
+                "percent_share_of_intended_air_yards":"ngs_pct_air_share"})
+            pg = pg.merge(nk.drop(columns=["team","week"], errors="ignore"), on=["player_id","game_id"], how="left")
+    except Exception as exc:
+        print(f"  current-season NGS unavailable (kept NaN): {exc}")
+
+    try:
+        snaps = nfl.import_snap_counts([CURRENT_SEASON])
+        pfr_col = next((c for c in ("pfr_player_id","pfr_id") if c in snaps.columns), None)
+        if pfr_col and "game_id" in snaps.columns and pfr_to_espn:
+            sk = snaps[[pfr_col,"game_id","offense_pct"]].copy()
+            sk["player_id"] = sk[pfr_col].map(pfr_to_espn)
+            sk = sk.dropna(subset=["player_id"])
+            sk["player_id"] = sk["player_id"].astype("int64")
+            sk["game_id"] = sk["game_id"].astype(str)
+            pg["game_id"] = pg["game_id"].astype(str)
+            pg = pg.merge(sk[["player_id","game_id","offense_pct"]].drop_duplicates(["player_id","game_id"]),
+                          on=["player_id","game_id"], how="left")
+    except Exception as exc:
+        print(f"  current-season snap share unavailable (kept NaN): {exc}")
+
+    pg["player_id"] = pg["player_id"].map(gsis_to_espn)
+    pg = pg[pg["player_id"].notna()].copy()
+    pg["player_id"] = pg["player_id"].astype("int64")
+    if pg.empty:
+        raise RuntimeError("current-season PBP rows could not be mapped from GSIS to ESPN player IDs")
+    pg.to_parquet(cache_path, index=False)
+    return pg
+
+
+def _sync_current_pbp(conn, target_week):
+    rows = _build_live_pbp_rows(target_week)
+    # Replace only CURRENT_SEASON rows; preserve every historical season in the DB.
+    conn.execute("DELETE FROM pbp_td_features WHERE season=?", (CURRENT_SEASON,))
+    conn.commit()
+    rows.to_sql("pbp_td_features", conn, if_exists="append", index=False)
+    return len(rows)
+
+
+def sync_current_season_data(conn, target_week):
+    """Refresh all completed CURRENT_SEASON data needed by the 30-feature model."""
+    if not target_week or int(target_week) <= 1:
+        return 0, 0
+    print(f"  syncing completed {CURRENT_SEASON} data through Week {int(target_week)-1}...")
+    games = _sync_current_boxscores(conn, int(target_week))
+    pbp_rows = _sync_current_pbp(conn, int(target_week))
+    box_count = conn.execute(
+        "SELECT COUNT(*) FROM player_game_logs WHERE season=? AND week<?",
+        (CURRENT_SEASON, int(target_week)),
+    ).fetchone()[0]
+    pbp_count = conn.execute(
+        "SELECT COUNT(*) FROM pbp_td_features WHERE season=?",
+        (CURRENT_SEASON,),
+    ).fetchone()[0]
+    if box_count == 0 or pbp_count == 0:
+        raise RuntimeError(
+            f"Week {target_week} requires completed {CURRENT_SEASON} data, but sync produced "
+            f"player_game_logs={box_count}, pbp_td_features={pbp_count}. Aborting instead of "
+            f"silently using {FALLBACK_SEASONS[0]} form."
+        )
+    print(f"  current-season sync OK: {games} completed games | {pbp_rows:,} PBP player-game rows")
+    return games, pbp_rows
+
+
+def apply_upcoming_game_features(latest, hist, matchup, target_week):
+    """Overwrite static/current-opponent features with the UPCOMING game's values."""
+    if latest.empty:
+        return latest
+    out = latest.copy()
+    context_rows = []
+    for _, r in out.iterrows():
+        tid = _safe_int(r.get("current_team_id"), 0)
+        mu = matchup.get(tid, {})
+        context_rows.append(mu)
+    out["opponent_id"] = [m.get("opp_id", np.nan) for m in context_rows]
+    out["temperature"] = [m.get("temperature", np.nan) for m in context_rows]
+    out["dome_game"] = [m.get("dome_game", np.nan) for m in context_rows]
+    out["weather_impact_score"] = [m.get("weather_impact_score", np.nan) for m in context_rows]
+    out["point_spread"] = [m.get("point_spread", np.nan) for m in context_rows]
+    out["over_under"] = [m.get("over_under", np.nan) for m in context_rows]
+
+    cur = hist[(hist["season"] == CURRENT_SEASON) & (hist["week"] < int(target_week))].copy()
+    if len(cur):
+        weekly = (cur.groupby(["opponent_id", "week"], as_index=False)["total_tds"].sum())
+        dmap = weekly.groupby("opponent_id")["total_tds"].mean().to_dict()
+        out["def_tds_allowed_asof"] = pd.to_numeric(out["opponent_id"], errors="coerce").map(dmap)
+    else:
+        out["def_tds_allowed_asof"] = np.nan
+    return out
 
 
 # ── FEATURE BUILD (identical to the trainer, minus the label) ────────────────
@@ -319,8 +756,7 @@ def roll_asof(df, cols, group="player_id", prefix="r_"):
 
 
 def build_history(conn):
-    """All player-games from the fallback seasons, with rolled features, so the
-    LAST row per player is his current as-of form for the upcoming game."""
+    """Completed historical player-games + raw per-game PBP features."""
     seasons = ",".join(str(s) for s in [CURRENT_SEASON] + FALLBACK_SEASONS)
     base = pd.read_sql(f"""
         SELECT p.player_id, p.player_name, p.season, p.week, p.opponent_id,
@@ -330,11 +766,10 @@ def build_history(conn):
                g.temperature, g.dome_game, g.weather_impact_score,
                g.point_spread, g.over_under
         FROM player_game_logs p JOIN game_context g ON p.game_id=g.game_id
-        WHERE p.season IN ({seasons}) AND (p.rushing_attempts>=1 OR p.targets>=1)
+        WHERE p.season IN ({seasons}) AND (COALESCE(p.rushing_attempts,0)>=1 OR COALESCE(p.targets,0)>=1)
         ORDER BY p.player_id, p.season, p.week""", conn)
     pbp = pd.read_sql("SELECT * FROM pbp_td_features", conn)
-    pbp["week"] = pd.to_numeric(pbp["game_id"].astype(str).str.split("_").str[1],
-                                errors="coerce")
+    pbp["week"] = pd.to_numeric(pbp["game_id"].astype(str).str.split("_").str[1], errors="coerce")
     additive = ["targets", "ez_targets", "inside10_targets", "inside5_targets",
                 "air_yards_game", "sum_td_prob", "carries", "ez_carries",
                 "inside5_carries", "rush_sum_td_prob"]
@@ -343,39 +778,30 @@ def build_history(conn):
     agg = {c: "sum" for c in additive if c in pbp.columns}
     agg.update({c: "max" for c in rate if c in pbp.columns})
     pbp = pbp.groupby(["player_id", "season", "week"], as_index=False).agg(agg)
-
     m = base.merge(pbp, on=["player_id", "season", "week"], how="left")
-    m = m.sort_values(["player_id", "season", "week"]).reset_index(drop=True)
-    m = pd.concat([m, roll_asof(m, PBP_ROLL_COLS)], axis=1)
-    for w in (3, 5, 8):
-        m[f"roll{w}_tds"] = m.groupby("player_id")["total_tds"].transform(
-            lambda s: s.rolling(w, min_periods=1).mean().shift(1))
-        m[f"roll{w}_touch"] = m.groupby("player_id")["total_touches"].transform(
-            lambda s: s.rolling(w, min_periods=1).mean().shift(1))
-    m["td_momentum"] = m.groupby("player_id")["total_tds"].transform(
-        lambda s: s.rolling(3, min_periods=1).sum().shift(1))
-    allowed = (m.groupby(["opponent_id", "season", "week"], as_index=False)["total_tds"]
-               .sum().rename(columns={"opponent_id": "def_team",
-                                      "total_tds": "tds_allowed"})
-               .sort_values(["def_team", "season", "week"]))
-    allowed["def_tds_allowed_asof"] = allowed.groupby(
-        ["def_team", "season"])["tds_allowed"].transform(
-        lambda s: s.expanding().mean().shift(1))
-    m = m.merge(allowed[["def_team", "season", "week", "def_tds_allowed_asof"]],
-                left_on=["opponent_id", "season", "week"],
-                right_on=["def_team", "season", "week"], how="left")
-    return m
+    return m.sort_values(["player_id", "season", "week"]).reset_index(drop=True)
 
 
 def current_form(hist):
-    """One row per player = his most recent game's as-of features. This is what
-    the upcoming game is predicted from. Note whether it came from CURRENT_SEASON
-    or a fallback, so Week 1 can be flagged."""
-    latest = (hist.dropna(subset=["roll8_touch"])
-              .sort_values(["player_id", "season", "week"])
-              .groupby("player_id").tail(1).copy())
-    latest["from_current_season"] = latest["season"] == CURRENT_SEASON
-    return latest
+    """Synthetic upcoming-game row built from ALL completed games.
+
+    Training uses shift(1) on a real game row. For an upcoming game there is no
+    row yet, so the exact equivalent is to aggregate every completed game through
+    the prior week. This intentionally includes the most recent completed game.
+    """
+    rows = []
+    for _, g in hist.groupby("player_id", sort=False):
+        g = g.sort_values(["season", "week"])
+        last = g.iloc[-1].copy()
+        for c in PBP_ROLL_COLS:
+            last[f"r_{c}"] = pd.to_numeric(g[c], errors="coerce").mean() if c in g.columns else np.nan
+        for w in (3, 5, 8):
+            last[f"roll{w}_tds"] = pd.to_numeric(g["total_tds"], errors="coerce").tail(w).mean()
+            last[f"roll{w}_touch"] = pd.to_numeric(g["total_touches"], errors="coerce").tail(w).mean()
+        last["td_momentum"] = pd.to_numeric(g["total_tds"], errors="coerce").tail(3).sum(min_count=1)
+        last["from_current_season"] = int(last["season"]) == CURRENT_SEASON
+        rows.append(last)
+    return pd.DataFrame(rows).reset_index(drop=True) if rows else hist.iloc[0:0].copy()
 
 
 def seed_rookies(latest, model_feats):
@@ -853,47 +1279,87 @@ def _form_label(row):
     return "2025"
 
 
-def print_prediction_table(rows, top_n=30):
-    """Old-style ranked table adapted to the current 2026 model output."""
-    if not rows:
-        print(f"\n{SEP}\n  TOP PROJECTIONS\n{SEP}")
-        print("  no valid projections")
+def _showcase_games(matchup):
+    """Return standalone/featured games using the OG primetime + holiday rules."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    eastern = ZoneInfo("America/New_York")
+    games = {}
+    for info in matchup.values():
+        gid = info.get("game_id")
+        if not gid or gid in games:
+            continue
+        date_s = info.get("event_date", "")
+        if not date_s:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(date_s).replace("Z", "+00:00")).astimezone(eastern)
+        except Exception:
+            continue
+        dow, d, hour = dt.strftime("%A"), dt.date(), dt.hour
+        label = None
+        if d.month == 12 and d.day == 25:
+            label = "Christmas Early Game" if hour < 15 else ("Christmas Afternoon Game" if hour < 18 else "Christmas Night Game")
+        elif dow == "Thursday" and d.month == 11 and d.day >= 21:
+            label = "Thanksgiving Early Game" if hour < 15 else ("Thanksgiving Afternoon Game" if hour < 18 else "Thanksgiving Night Game")
+        elif dow == "Friday" and d.month == 11 and d.day >= 22:
+            label = "Black Friday Game"
+        elif dow == "Thursday" and hour >= 19:
+            label = "Thursday Night Football"
+        elif dow == "Sunday" and hour >= 19:
+            label = "Sunday Night Football"
+        elif dow == "Monday" and hour >= 19:
+            label = "Monday Night Football"
+        if label:
+            games[gid] = {
+                "game_id": gid, "label": label, "date_et": dt,
+                "home": normalize_team_name(info.get("home_abbr", "")),
+                "away": normalize_team_name(info.get("away_abbr", "")),
+            }
+    return sorted(games.values(), key=lambda g: g["date_et"])
+
+
+def print_showcase_prediction_tables(rows, matchup, top_n=15):
+    """Print one projection table per TNF/SNF/MNF or holiday showcase game."""
+    games = _showcase_games(matchup)
+    if not games:
+        print(f"\n{SEP}\n  NIGHT / HOLIDAY GAME PROJECTIONS\n{SEP}")
+        print("  no Thursday-night, Sunday-night, Monday-night, or holiday showcase games found")
         return
-
-    top = sorted(rows, key=lambda r: r["p_td"], reverse=True)[:top_n]
-
-    print(f"\n{SEP}\n  ANYTIME TD PROJECTIONS\n{SEP}")
-    print(
-        f"  {'#':>2} {'player':<24} {'pos':<4} {'tm':<4} {'matchup':<10}"
-        f"{'P(TD)':>8} {'fair':>7} {'book':<14} {'odds':>7} {'edge':>8}"
-        f" {'touch8':>7} {'ezC':>6} {'ezT':>6} {'form':>8}"
-    )
-    print("  " + "-" * 122)
-
-    for i, r in enumerate(top, 1):
-        team = str(r.get("team", ""))[:4]
-        opp = str(r.get("opp", ""))[:4]
-        matchup = f"{team}-{opp}" if team and opp else team or "—"
-        fair = r.get("fair")
-        fair_s = "—" if fair is None or pd.isna(fair) else f"{int(fair):+d}"
-        book = str(r.get("book", "—") or "—")[:14]
-        touch8 = r.get("touch8", np.nan)
-        ezc = r.get("ez_car", np.nan)
-        ezt = r.get("ez_tgt", np.nan)
-
+    for g in games:
+        teams = {g["home"], g["away"]}
+        game_rows = [r for r in rows if normalize_team_name(str(r.get("team", ""))) in teams]
+        game_rows.sort(key=lambda r: r.get("p_td", 0.0), reverse=True)
+        if top_n is not None:
+            game_rows = game_rows[:top_n]
+        title = f"{g['label'].upper()} — {g['away']} @ {g['home']}"
+        when = g["date_et"].strftime("%a %b %d, %Y %I:%M %p ET")
+        print(f"\n{SEP}\n  {title}\n  {when}\n{SEP}")
+        if not game_rows:
+            print("  no model rows matched these two teams")
+            continue
         print(
-            f"  {i:>2}. {str(r['player'])[:23]:<24} "
-            f"{str(r.get('pos',''))[:3]:<4} {team:<4} {matchup:<10}"
-            f"{r['p_td']:>8.1%} {fair_s:>7} {book:<14} {_fmt_odds(r.get('odds')):>7}"
-            f"{_fmt_edge(r):>8} "
-            f"{touch8:>7.1f} {ezc:>6.2f} {ezt:>6.2f} {_form_label(r):>8}"
+            f"  {'#':>2} {'player':<24} {'pos':<4} {'tm':<4}"
+            f"{'P(TD)':>8} {'fair':>7} {'book':<14} {'odds':>7} {'edge':>8}"
+            f" {'touch8':>7} {'ezC':>6} {'ezT':>6} {'form':>8}"
         )
-
-    print("\n  form: 2026=current-season history | 2025=prior-season fallback | ROOKIE=projection seed")
-
+        print("  " + "-" * 110)
+        for i, r in enumerate(game_rows, 1):
+            team = str(r.get("team", ""))[:4]
+            fair = r.get("fair")
+            fair_s = "—" if fair is None or pd.isna(fair) else f"{int(fair):+d}"
+            book = str(r.get("book", "—") or "—")[:14]
+            touch8, ezc, ezt = r.get("touch8", np.nan), r.get("ez_car", np.nan), r.get("ez_tgt", np.nan)
+            print(
+                f"  {i:>2}. {str(r['player'])[:23]:<24} "
+                f"{str(r.get('pos',''))[:3]:<4} {team:<4}"
+                f"{r['p_td']:>8.1%} {fair_s:>7} {book:<14} {_fmt_odds(r.get('odds')):>7}"
+                f"{_fmt_edge(r):>8} {touch8:>7.1f} {ezc:>6.2f} {ezt:>6.2f} {_form_label(r):>8}"
+            )
+        print("\n  form: 2026=current-season history | 2025=prior-season fallback | ROOKIE=projection seed")
 
 def print_single_bets(bets):
-    print(f"\n{SEP}\n  QUALIFIED SINGLE BETS  (1/8 Kelly, tiered edges)\n{SEP}")
+    print(f"\n{SEP}\n  QUALIFIED SINGLE BETS  (sorted by P(TD), 1/8 Kelly, tiered edges)\n{SEP}")
     if not bets:
         print("  no singles clear the edge thresholds this slate")
         return
@@ -979,22 +1445,32 @@ def main():
     print(f"  model: {b.get('model_type','?')}  |  {len(feats)} features")
     print(f"  cache: {CACHE_DIR}")
 
-    conn = sqlite3.connect(DB)
-    hist = build_history(conn)
-    conn.close()
-    have_current = (hist["season"] == CURRENT_SEASON).any()
-    if not have_current:
-        print(f"  no {CURRENT_SEASON} games yet — using most recent season "
-              f"({FALLBACK_SEASONS[0]}) form for Week 1 projections")
-
-    # ── which week are we predicting? ──
+    # Resolve the target week FIRST, then refresh every completed current-season
+    # game required to build true as-of-week features.
     seas, wk, playing, matchup = resolve_slate(FORCE_WEEK)
     if wk:
         print(f"  upcoming slate: {seas} week {wk}  |  {len(playing)} teams playing")
         if not playing:
-            print(f"  (no games returned — odds/slate may not be posted yet)")
+            print("  (no games returned — odds/slate may not be posted yet)")
     else:
-        print(f"  could not resolve the slate from ESPN; scoring all players")
+        raise RuntimeError("could not resolve the upcoming NFL week; refusing to score a stale slate")
+
+    conn = sqlite3.connect(DB)
+    if int(wk) > 1:
+        sync_current_season_data(conn, int(wk))
+    hist = build_history(conn)
+    conn.close()
+
+    current_rows = hist[(hist["season"] == CURRENT_SEASON) & (hist["week"] < int(wk))]
+    if int(wk) == 1:
+        print(f"  Week 1: using {FALLBACK_SEASONS[0]} veteran history where 2026 history does not exist")
+    elif current_rows.empty:
+        raise RuntimeError(
+            f"Week {wk} requires {CURRENT_SEASON} completed-game history; none was loaded. "
+            "Aborting instead of generating stale prior-season predictions."
+        )
+    else:
+        print(f"  using {len(current_rows):,} {CURRENT_SEASON} player-game rows through Week {int(wk)-1}")
 
     latest = current_form(hist)
     latest = seed_rookies(latest, feats)
@@ -1002,6 +1478,7 @@ def main():
     # Current 2026 ESPN rosters are authoritative for player identity.
     # Historical rows remain untouched as feature/form history.
     latest, current_roster = attach_current_roster(latest, playing, matchup)
+    latest = apply_upcoming_game_features(latest, hist, matchup, int(wk))
 
     # Remove confirmed OUT/IR/inactive players independently of sportsbook odds.
     latest = filter_unavailable_players(latest)
@@ -1063,12 +1540,15 @@ def main():
         if r["eval"]["should_bet"]
         and not r.get("is_rookie_seed", False)
     ]
-    bets.sort(key=lambda r: -r["eval"]["edge"])
+    bets.sort(key=lambda r: r.get("p_td", 0.0), reverse=True)
     print_single_bets(bets)
 
     # ── PARLAYS (3 types, 0.75 haircut) ──
     parlays = generate_parlays(bets)
     print_parlay_table(parlays)
+
+    # Dedicated standalone/holiday projection tables; no generic all-slate Top-30 table.
+    print_showcase_prediction_tables(rows, matchup, top_n=15)
 
     # Persist the exact pregame decision state for prospective grading.
     pred_records = []
@@ -1099,8 +1579,14 @@ def main():
         "NFL_TD_PREDICTIONS_OUT",
         str(predictions_dir / f"nfl_td_predictions_{CURRENT_SEASON}.csv"),
     ))
+    from datetime import datetime, timezone
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snapshot_archive_out = predictions_dir / (
+        f"nfl_td_predictions_{int(seas or CURRENT_SEASON)}_{week_tag}_run_{run_stamp}.csv"
+    )
     res.to_csv(snapshot_out, index=False)
     res.to_csv(latest_out, index=False)
+    res.to_csv(snapshot_archive_out, index=False)
 
     parlay_rows = []
     for pidx, p in enumerate(parlays, 1):
@@ -1133,14 +1619,21 @@ def main():
                 "form_source": _form_label(leg),
             })
     parlays_out = predictions_dir / f"nfl_td_parlays_{int(seas or CURRENT_SEASON)}_{week_tag}.csv"
-    pd.DataFrame(parlay_rows).to_csv(parlays_out, index=False)
+    parlays_archive_out = predictions_dir / (
+        f"nfl_td_parlays_{int(seas or CURRENT_SEASON)}_{week_tag}_run_{run_stamp}.csv"
+    )
+    parlay_df = pd.DataFrame(parlay_rows)
+    parlay_df.to_csv(parlays_out, index=False)
+    parlay_df.to_csv(parlays_archive_out, index=False)
 
-    print(f"\n  saved predictions snapshot -> {snapshot_out}")
-    print(f"  saved latest predictions   -> {latest_out}")
-    print(f"  saved parlays              -> {parlays_out}")
+    print(f"\n  saved latest predictions    -> {latest_out}  [overwritten each run]")
+    print(f"  saved weekly predictions    -> {snapshot_out}  [latest Week {int(wk or FORCE_WEEK or 0)} run]")
+    print(f"  archived prediction run     -> {snapshot_archive_out}  [never overwritten]")
+    print(f"  saved weekly parlays        -> {parlays_out}  [latest Week {int(wk or FORCE_WEEK or 0)} run]")
+    print(f"  archived parlay run         -> {parlays_archive_out}  [never overwritten]")
 
-    if not have_current:
-        print(f"\n  NOTE: veteran rows use {FALLBACK_SEASONS[0]} fallback form before "
+    if int(wk) == 1:
+        print(f"\n  NOTE: Week-1 veteran rows may use {FALLBACK_SEASONS[0]} fallback form before "
               f"Week 1 but may still qualify if they pass the betting thresholds.")
         print("  True rookie projection seeds remain excluded from auto-bets/parlays "
               "until real NFL history is available.")
